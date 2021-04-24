@@ -38,6 +38,7 @@ RESPONSE_CODES = {
     602: 'room not found',
 }
 
+MAX_ACTION_RETRIES = 3
 
 class ServerEndpointInfo(object):
     def __init__(self, server: Server, keygen_fn: Callable[[str, int], str], force_v=None):
@@ -233,10 +234,15 @@ class PadApiClient(object):
         self.recommended_helpers_data = RecommendedHelpersResponse(
             self.action(EndpointAction.GET_RECOMMENDED_HELPERS))
 
-    def action(self, action: EndpointAction):
+    def action(self, action: EndpointAction, post_data=None):
+        """Perform an API action.
+        
+        Will use POST if post_data is given. Else, uses GET.
+        
+        If SID fails, re-logn and retries the action, up to MAX_ACTION_RETRIES times.
+        """
         payload = self.get_action_payload(action)
-        url = self.build_url(payload)
-        action_json = self.get_json_results(url)
+        action_json = self._send_action(payload, post_data)
         return action_json
 
     def get_login_payload(self):
@@ -293,10 +299,7 @@ class PadApiClient(object):
             'decksb': json.dumps({'fmt': 1, 'decks': decks})
         }
 
-        payload = self.get_action_payload(EndpointAction.SAVE_DECKS)
-
-        url = self.build_url(payload)
-        action_json = self.get_json_results(url, post_data=post_data)
+        action_json = self.action(EndpointAction.SAVE_DECKS, post_data=post_data)
         return action_json
 
     def get_any_friend(self):
@@ -400,16 +403,12 @@ class PadApiClient(object):
         r.raise_for_status()  #May raise
         result_json = r.json()  #May raise
         response_code = result_json['res']  #May raise
-        if response_code == 0:
-            self.resfails = 0
-            return result_json
-        self.resfails += 1
-        if response_code == 2 and self.resfails < 3:
-            # Try to log in and do it again.
-            self.login()
-            return self.get_json_results(url, post_data)
-        else:
-            raise Exception('Bad server response: {} ({})'.format(response_code, RESPONSE_CODES.get(response_code, '???')))
+        if response_code == 2:
+            raise PADSessionError
+        elif response_code != 0:
+            raise Exception(
+                'Unhandled server response: {} ({})'.format(response_code, RESPONSE_CODES.get(response_code, '???')))
+        return result_json
 
     def get_egg_machine_page(self, gtype, grow):
         payload = [
@@ -427,3 +426,21 @@ class PadApiClient(object):
 
         r = requests.get(final_url, headers=headers)
         return r.text
+
+    def _send_action(self, payload, post_data):
+        for retry_count in range(MAX_ACTION_RETRIES):
+            url = self.build_url(payload)
+            try:
+                action_json = self.get_json_results(url, post_data)
+            except PADSessionError:
+                # Maybe sleep a bit?
+                self.login()
+                continue
+            else:
+                return action_json
+        raise PADSessionError
+
+
+class PADSessionError(Exception):
+    pass
+
